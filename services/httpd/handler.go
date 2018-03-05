@@ -14,6 +14,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -120,11 +121,12 @@ type Handler struct {
 	CompilerMappings flux.CompilerMappings
 	registered       bool
 
-	Config    *Config
-	Logger    *zap.Logger
-	CLFLogger *log.Logger
-	accessLog *os.File
-	stats     *Statistics
+	Config           *Config
+	Logger           *zap.Logger
+	CLFLogger        *log.Logger
+	accessLog        *os.File
+	accessLogFilters statusFilters
+	stats            *Statistics
 
 	requestTracker *RequestTracker
 	writeThrottler *Throttler
@@ -236,6 +238,15 @@ func (h *Handler) Open() {
 		h.Logger.Info("opened HTTP access log", zap.String("path", path))
 	}
 
+	for _, s := range h.Config.AccessLogStatusFilters {
+		sf, err := newStatusFilter(s)
+		if err != nil {
+			h.Logger.Warn("Dropping invalid access log status filter", zap.String("filter", s), zap.Error(err))
+			continue
+		}
+		h.accessLogFilters = append(h.accessLogFilters, sf)
+	}
+
 	if h.Config.FluxEnabled {
 		h.registered = true
 		prom.MustRegister(h.Controller.PrometheusCollectors()...)
@@ -246,6 +257,7 @@ func (h *Handler) Close() {
 	if h.accessLog != nil {
 		h.accessLog.Close()
 		h.accessLog = nil
+		h.accessLogFilters = nil
 	}
 
 	if h.registered {
@@ -1651,7 +1663,10 @@ func (h *Handler) logging(inner http.Handler, name string) http.Handler {
 		start := time.Now()
 		l := &responseLogger{w: w}
 		inner.ServeHTTP(l, r)
-		h.CLFLogger.Println(buildLogLine(l, r, start))
+
+		if h.accessLogFilters.Match(l.Status()) {
+			h.CLFLogger.Println(buildLogLine(l, r, start))
+		}
 
 		// Log server errors.
 		if l.Status()/100 == 5 {
@@ -1840,4 +1855,65 @@ func (t *Throttler) Handler(h http.Handler) http.Handler {
 		// Execute request.
 		h.ServeHTTP(w, r)
 	})
+}
+
+type statusFilters []*statusFilter
+
+// Match will return true if the status filters are empty or if at least one filter
+// matches the status code.
+func (a statusFilters) Match(statusCode int) bool {
+	if len(a) == 0 {
+		return true
+	}
+
+	for _, sf := range a {
+		if sf.Match(statusCode) {
+			return true
+		}
+	}
+	return false
+}
+
+// statusFilter will check if an http status code matches a certain pattern.
+type statusFilter struct {
+	base    int
+	divisor int
+}
+
+// Match will check if the status code matches this filter.
+func (sf *statusFilter) Match(statusCode int) bool {
+	return statusCode/sf.divisor == sf.base
+}
+
+// reStatusFilter ensures that the format is digits optionally followed by X values.
+var reStatusFilter = regexp.MustCompile(`^(\d+)([xX]*)$`)
+
+// newStatusFilter will create a new status filter from the string.
+func newStatusFilter(s string) (*statusFilter, error) {
+	m := reStatusFilter.FindStringSubmatch(s)
+	if m == nil {
+		return nil, fmt.Errorf("status filter must be a digit optionally followed by X characters")
+	} else if len(s) != 3 {
+		return nil, fmt.Errorf("status filter must be exactly 3 characters long")
+	}
+
+	// Compute the divisor and the expected value. If we have one X, we divide by 10 so we are only comparing
+	// the first two numbers. If we have two Xs, we divide by 100 so we only compare the first number. We
+	// then check if the result is equal to the remaining number.
+	base, err := strconv.Atoi(m[1])
+	if err != nil {
+		return nil, err
+	}
+
+	divisor := 1
+	switch len(m[2]) {
+	case 1:
+		divisor = 10
+	case 2:
+		divisor = 100
+	}
+	return &statusFilter{
+		base:    base,
+		divisor: divisor,
+	}, nil
 }

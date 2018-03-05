@@ -49,6 +49,7 @@ type Config struct {
 	BindSocket              string        `toml:"bind-socket"`
 	MaxBodySize             int           `toml:"max-body-size"`
 	AccessLogPath           string        `toml:"access-log-path"`
+	AccessLogStatusFilters  []string      `toml:"access-log-status-filters"`
 	MaxConcurrentWriteLimit int           `toml:"max-concurrent-write-limit"`
 	MaxEnqueuedWriteLimit   int           `toml:"max-enqueued-write-limit"`
 	EnqueuedWriteTimeout    time.Duration `toml:"enqueued-write-timeout"`
